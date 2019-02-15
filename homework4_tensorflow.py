@@ -1,36 +1,43 @@
 import tensorflow as tf
+import random as rn
 import numpy as np
 import time
+import os
 
-from keras import backend as K
-
-# pick 1 ...
+# pick a source:
 #source = "Admissions.csv" # binary (2 classes)
 #source = "Advertising.csv" # numerical
-#source = "IRIS" # categorical (3 classes)
-source = "MNIST" # categorical (10 classes)
+source = "IRIS" # categorical (3 classes)
+#source = "MNIST" # categorical (10 classes)
 
 ##############################
 ### USER ADJUSTABLE PARAMS ###
 ##############################
 normalize_inputs = True
 normalize_outputs = True
-mnist_data_scale = 1 # scale the number of training and testing entries .. useful to speed things up
 learning_rate = 0.02
 batch_size = 20
 epochs = 500
 num_hidden = 10
-activation = 'relu'
-random_seed = 41
 shuffle = True
-use_gpu = True
-use_conv = False # not supported yet
-input_as_images = False and use_conv
+use_gpu = False # it's actually slower on GPU to run such a simple network
+force_deterministic = True
+random_seed = 41
+max_predictions = 999
 ##############################
 ##############################
 
 print("tensorflow version =", tf.__version__, "\n")
-tf.set_random_seed(random_seed)
+print("source = {}".format(source))
+
+if force_deterministic:
+	os.environ['PYTHONHASHSEED'] = '0'
+	rn.seed(random_seed)
+	np.random.seed(random_seed)
+	tf.set_random_seed(random_seed) # just setting this is not enough ..
+
+options = tf.RunOptions(report_tensor_allocations_upon_oom = True)
+config = tf.ConfigProto(device_count = {'GPU': 1 if use_gpu else 0})
 np.set_printoptions(formatter={'float': '{: 2.6f}'.format})
 
 def one_hot(arrays):
@@ -64,32 +71,18 @@ merge = False
 if source == "MNIST":
 	from keras.datasets import mnist
 	(x_train, y_train), (x_test, y_test) = mnist.load_data()
-	if mnist_data_scale < 1:
-		x_train = x_train[:-int(x_train.shape[0] * (1 - mnist_data_scale))]
-		y_train = y_train[:-int(y_train.shape[0] * (1 - mnist_data_scale))]
-		x_test = x_test[:-int(x_test.shape[0] * (1 - mnist_data_scale))]
-		y_test = y_test[:-int(y_test.shape[0] * (1 - mnist_data_scale))]
 	[train_entries, image_width, image_height] = x_train.shape
 	[test_entries, image_width_, image_height_] = x_test.shape
 	assert (image_width, image_height) == (image_width_, image_height_)
 	image_size = image_width * image_height
-	if input_as_images:
-		if K.image_data_format() == 'channels_first':
-			x_train = x_train.reshape(train_entries, 1, image_width, image_height)
-			x_test = x_test.reshape(test_entries, 1, image_width, image_height)
-			input_shape = (1, image_width, image_height)
-		else:
-			x_train = x_train.reshape(train_entries, image_width, image_height, 1)
-			x_test = x_test.reshape(test_entries, image_width, image_height, 1)
-			input_shape = (image_width, image_height, 1)
-	else:
-		x_train = x_train.reshape(train_entries, image_size)
-		x_test = x_test.reshape(test_entries, image_size)
+	x_train = x_train.reshape(train_entries, image_size)
+	x_test = x_test.reshape(test_entries, image_size)
 	x_train = x_train.astype('float32') / 255
 	x_test = x_test.astype('float32') / 255
-	num_inputs = x_train.shape[1]
+	num_inputs = image_size
 	num_classes = max(np.amax(y_train), np.amax(y_test)) + 1
 	normalize_inputs = False
+	max_predictions = 20 # don't spam
 	split = False
 	merge = True
 	batch_size = 200 # MNIST has a large training set - help it to be faster
@@ -154,15 +147,11 @@ elif normalize_outputs: # scale output values to 0..1
 
 # set up tensorflow graph
 num_outputs = num_classes
-X = tf.placeholder(tf.float32)
-Y = tf.placeholder(tf.float32)
+X = tf.placeholder(tf.float32)#, [None, num_inputs])
+Y = tf.placeholder(tf.float32)#, [None, num_outputs])
 W1 = tf.Variable(tf.glorot_uniform_initializer()((num_inputs, num_hidden)))
 b1 = tf.Variable(tf.zeros([num_hidden]))
-H1 = tf.matmul(X, W1) + b1
-if activation == 'relu':
-	H1 = tf.nn.relu(H1)
-else:
-	H1 = tf.sigmoid(H1)
+H1 = tf.nn.relu(tf.matmul(X, W1) + b1)
 W2 = tf.Variable(tf.glorot_uniform_initializer()((num_hidden, num_outputs)))
 b2 = tf.Variable(tf.zeros([num_outputs]))
 H2 = tf.matmul(H1, W2) + b2
@@ -177,10 +166,6 @@ else:
 cost_batch = cost * tf.cast(tf.shape(Y)[0], tf.float32)
 update = tf.train.GradientDescentOptimizer(learning_rate).minimize(cost)
 
-options = tf.RunOptions(report_tensor_allocations_upon_oom = True)
-config = tf.ConfigProto(device_count = {'GPU': 1 if use_gpu else 0})
-#config.gpu_options.per_process_gpu_memory_fraction = 0.5
-#config.gpu_options.allow_growth = True
 with tf.Session(config=config) as sess:
 	init = tf.global_variables_initializer()
 	sess.run(init, options=options)
@@ -206,20 +191,25 @@ with tf.Session(config=config) as sess:
 		else:
 			cost_out, _ = sess.run([cost, update], feed_dict={X: x_train, Y: y_train}, options=options)
 		if epoch < 10 or (epoch % 10) == 0:
-			if epoch < 10:
+			if epoch <= 10:
 				time1 = time.perf_counter()
 				time_str = ", time = {}".format(get_time_string(time1 - epoch_time))
 				epoch_time = time1
 			else:
 				time_str = ""
 			if num_classes > 1:
-				print("epoch {}: accuracy = {}, cost = {:.6f}{}".format(epoch, get_accuracy_string(), cost_out, time_str))
+				accuracy_str = " accuracy = {},".format(get_accuracy_string())
 			else:
-				if normalize_outputs:
-					cost_out *= (y_max - y_min) ** 2
-				print("epoch {}: cost = {:.6f}{}".format(epoch, cost_out, time_str))
+				accuracy_str = ""
+			if normalize_outputs:
+				cost_out *= (y_max - y_min) ** 2
+			print("epoch {}:{} cost = {:.9f}{}".format(epoch, accuracy_str, cost_out, time_str))
 	duration = time.perf_counter() - start_time
-	print("epoch {}: accuracy = {}, total time = {} ({}/epoch)".format(epochs, get_accuracy_string(), get_time_string(duration), get_time_string(duration / epochs)))
+	if num_classes > 1:
+		accuracy_str = " accuracy = {},".format(get_accuracy_string())
+	else:
+		accuracy_str = ""
+	print("epoch {}:{} total time = {} ({}/epoch)".format(epochs, accuracy_str, get_time_string(duration), get_time_string(duration / epochs)))
 
 	# print out weights and biases
 	W1_out, b1_out, W2_out, b2_out = sess.run([W1, b1, W2, b2], options=options)
@@ -238,7 +228,7 @@ with tf.Session(config=config) as sess:
 			n, m = np.shape(x)
 			print("\n{} data:".format(s))
 			for i in range(n):
-				if i >= 10:
+				if i >= max_predictions:
 					print("...")
 					break
 				x_ = x[i]
@@ -275,7 +265,7 @@ with tf.Session(config=config) as sess:
 			input_str = ""
 			suppress = False
 			for i in range(n):
-				if i >= 10 and not suppress:
+				if i >= max_predictions and not suppress:
 					print("...")
 					suppress = True
 				x_ = x[i]
